@@ -5,6 +5,7 @@ import random
 import numpy as np
 from pathlib import Path
 import yaml
+import subprocess
 
 # --------------------------
 # SETTINGS
@@ -16,26 +17,98 @@ labels_dir = dataset_dir / 'labels' / 'train'
 AUG_PER_IMAGE = 10       # Number of augmentations per image
 
 # --------------------------
-# UTILITY FUNCTIONS
+# DETECTION FUNCTIONS
 # --------------------------
-def augment_image(img):
+def detect_bounding_box(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 5)
     h, w = img.shape[:2]
 
-    # Random rotation
+    # Try circle detection first
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=30,
+        param1=100,
+        param2=30,
+        minRadius=10,
+        maxRadius=0
+    )
+
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        x, y, r = circles[0]
+        x_center = x / w
+        y_center = y / h
+        width = height = (2 * r) / w
+        return x_center, y_center, width, height
+
+    # Fallback to ellipse fitting
+    _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 500]
+
+    if contours:
+        cnt = max(contours, key=cv2.contourArea)
+        if len(cnt) >= 5:
+            ellipse = cv2.fitEllipse(cnt)
+            (x, y), (MA, ma), _ = ellipse
+            x_center = x / w
+            y_center = y / h
+            width = MA / w
+            height = ma / h
+            return x_center, y_center, width, height
+
+        # Fallback to bounding box
+        x, y, box_w, box_h = cv2.boundingRect(cnt)
+        x_center = (x + box_w / 2) / w
+        y_center = (y + box_h / 2) / h
+        width = box_w / w
+        height = box_h / h
+        return x_center, y_center, width, height
+
+    # Final fallback: full image
+    return 0.5, 0.5, 1.0, 1.0
+
+# --------------------------
+# AUGMENTATION FUNCTION
+# --------------------------
+def augment_image(img, bbox):
+    h, w = img.shape[:2]
+    x_center, y_center, box_w, box_h = bbox
+
+    # Zoom-out
+    if random.random() > 0.5:
+        scale = random.uniform(0.3, 0.8)
+        new_w, new_h = int(w * scale), int(h * scale)
+        small = cv2.resize(img, (new_w, new_h))
+        canvas = np.zeros_like(img)
+        x_offset = (w - new_w) // 2
+        y_offset = (h - new_h) // 2
+        canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = small
+        img = canvas
+        x_center = (x_offset + new_w / 2) / w
+        y_center = (y_offset + new_h / 2) / h
+        box_w = new_w / w
+        box_h = new_h / h
+
+    # Rotation
     angle = random.uniform(-30, 30)
-    M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
     img = cv2.warpAffine(img, M, (w, h))
 
-    # Random flip
+    # Flip
     if random.random() > 0.5:
         img = cv2.flip(img, 1)
+        x_center = 1 - x_center
 
     # Brightness/contrast
     alpha = random.uniform(0.8, 1.2)
     beta = random.randint(-20, 20)
     img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
 
-    # Gaussian blur
+    # Blur
     if random.random() > 0.7:
         img = cv2.GaussianBlur(img, (5, 5), 0)
 
@@ -51,17 +124,17 @@ def augment_image(img):
     hsv = np.clip(hsv, 0, 255).astype(np.uint8)
     img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    return img
+    return img, (x_center, y_center, box_w, box_h)
 
 # --------------------------
-# PREP DATASET FOLDERS
+# PREP FOLDERS
 # --------------------------
 shutil.rmtree(dataset_dir, ignore_errors=True)
 images_dir.mkdir(parents=True, exist_ok=True)
 labels_dir.mkdir(parents=True, exist_ok=True)
 
 # --------------------------
-# FIND CLASS NAMES
+# FIND CLASSES
 # --------------------------
 image_files = [f for f in os.listdir(source_dir) if f.lower().endswith('.jpg')]
 class_names = sorted(set(os.path.splitext(f)[0].split('_')[0] for f in image_files))
@@ -70,7 +143,7 @@ class_to_index = {name: i for i, name in enumerate(class_names)}
 print("🧠 Found classes:", class_to_index)
 
 # --------------------------
-# AUGMENT AND SAVE IMAGES + LABELS
+# AUGMENT AND SAVE
 # --------------------------
 img_id = 0
 for file in image_files:
@@ -83,20 +156,22 @@ for file in image_files:
         print(f"❌ Could not read {file}")
         continue
 
-    # Save original image
+    bbox = detect_bounding_box(img)
+
+    # Save original
     out_img_path = images_dir / f"{class_name}_{img_id}.jpg"
     label_path = labels_dir / f"{class_name}_{img_id}.txt"
     cv2.imwrite(str(out_img_path), img)
-    label_path.write_text(f"{class_index} 0.5 0.5 1.0 1.0\n")
+    label_path.write_text(f"{class_index} {bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n")
     img_id += 1
 
-    # Create augmented versions
+    # Augmentations
     for i in range(AUG_PER_IMAGE):
-        aug = augment_image(img)
+        aug, aug_bbox = augment_image(img, bbox)
         out_img_path = images_dir / f"{class_name}_{img_id}.jpg"
         label_path = labels_dir / f"{class_name}_{img_id}.txt"
         cv2.imwrite(str(out_img_path), aug)
-        label_path.write_text(f"{class_index} 0.5 0.5 1.0 1.0\n")
+        label_path.write_text(f"{class_index} {aug_bbox[0]:.6f} {aug_bbox[1]:.6f} {aug_bbox[2]:.6f} {aug_bbox[3]:.6f}\n")
         img_id += 1
 
 print(f"\n✅ Dataset created: {img_id} images")
@@ -106,7 +181,7 @@ print(f"\n✅ Dataset created: {img_id} images")
 # --------------------------
 data_yaml = {
     'train': str(images_dir.resolve()),
-    'val': str(images_dir.resolve()),
+    'val': str(images_dir.resolve()),  # same as train here
     'nc': len(class_names),
     'names': class_names
 }
@@ -120,22 +195,10 @@ print(f"📄 data.yaml saved to: {yaml_path}")
 # TRAIN YOLOv5
 # --------------------------
 print("\n🚀 Starting YOLOv5 training...\n")
-import subprocess
 
 def run_command(command):
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in process.stdout:
-        print(line, end='')  # print each line as it's produced
+        print(line, end='')
 
-# Replace os.system with run_command
-run_command(f"python yolov5/train.py --img 640 --batch -1 --epochs 50 --data {yaml_path} --weights yolov5s.pt --name spinchain-yolo")
-
-
-# --------------------------
-# EVALUATE THE MODEL
-# --------------------------
-print("\n🔍 Running evaluation...\n")
-best_weights = Path("runs/train/spinchain-yolo/weights/best.pt")
-os.system(f"python yolov5/val.py --img 640 --data {yaml_path} --weights {best_weights} --save-conf --save-json --project eval_output --name spinchain_eval --exist-ok")
-
-print("\n🎯 Done! Evaluation results saved in: eval_output/")
+run_command(f"python yolov5/train.py --img 640 --batch -1 --epochs 100 --data {yaml_path} --weights yolov5s.pt --name spinchain-yolo")
