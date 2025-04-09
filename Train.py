@@ -16,7 +16,7 @@ dataset_dir = Path('./beyblade_dataset')
 images_dir = dataset_dir / 'images' / 'train'
 labels_dir = dataset_dir / 'labels' / 'train'
 AUG_PER_IMAGE = 10
-MULTI_IMG_COUNT = 500
+MULTI_IMG_COUNT = 3000
 ARENA_PATH = "arena_bg.jpg"  # your arena image here
 
 # --------------------------
@@ -56,7 +56,7 @@ def augment_image(img, bbox):
 
     # Zoom-out
     if random.random() > 0.5:
-        scale = random.uniform(0.3, 0.8)
+        scale = random.uniform(0.6, 0.9)
         new_w, new_h = int(w * scale), int(h * scale)
         small = cv2.resize(img, (new_w, new_h))
         canvas = np.zeros_like(img)
