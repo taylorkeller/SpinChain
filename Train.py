@@ -15,9 +15,9 @@ source_dir = Path('.')
 dataset_dir = Path('./beyblade_dataset')
 images_dir = dataset_dir / 'images' / 'train'
 labels_dir = dataset_dir / 'labels' / 'train'
-AUG_PER_IMAGE = 10
-MULTI_IMG_COUNT = 3000
-ARENA_PATH = "arena_bg.jpg"  # your arena image here
+AUG_PER_IMAGE = 8
+MULTI_IMG_COUNT = 25000
+ARENA_PATH = "arena_bg.jpg"
 
 # --------------------------
 # DETECTION FUNCTIONS
@@ -31,7 +31,7 @@ def detect_bounding_box(img):
                                param1=50, param2=20, minRadius=15, maxRadius=60)
     if circles is not None:
         x, y, r = np.round(circles[0, 0]).astype("int")
-        return x / w, y / h, 2 * r / w, 2 * r / h
+        return (x / w, y / h, 2 * r / w, 2 * r / h), 'circle'
 
     _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -41,22 +41,45 @@ def detect_bounding_box(img):
         cnt = max(contours, key=cv2.contourArea)
         if len(cnt) >= 5:
             (x, y), (MA, ma), _ = cv2.fitEllipse(cnt)
-            return x / w, y / h, MA / w, ma / h
-        x, y, box_w, box_h = cv2.boundingRect(cnt)
-        return (x + box_w / 2) / w, (y + box_h / 2) / h, box_w / w, box_h / h
+            return (x / w, y / h, MA / w, ma / h), 'ellipse'
 
-    return 0.5, 0.5, 1.0, 1.0
+    return None, 'none'
+
+def is_bbox_too_large(x, y, w, h, threshold=0.9):
+    return w > threshold or h > threshold
+
+def is_low_contrast_crop(img, threshold=15):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return gray.std() < threshold
+
+def has_enough_edges(img, threshold=30):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 100, 200)
+    return np.count_nonzero(edges) > threshold
+
+def is_bbox_meaningful(img, bbox):
+    x, y, w, h = bbox
+    H, W = img.shape[:2]
+    x1 = int((x - w / 2) * W)
+    y1 = int((y - h / 2) * H)
+    x2 = int((x + w / 2) * W)
+    y2 = int((y + h / 2) * H)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(W, x2), min(H, y2)
+    crop = img[y1:y2, x1:x2]
+    if crop.shape[0] < 10 or crop.shape[1] < 10:
+        return False
+    return not is_low_contrast_crop(crop) and has_enough_edges(crop)
 
 # --------------------------
-# AUGMENTATION FUNCTION
+# AUGMENTATION FUNCTION (with bbox size check)
 # --------------------------
-def augment_image(img, bbox):
+def augment_image(img, bbox, max_box_ratio=0.8):
     h, w = img.shape[:2]
     x_center, y_center, box_w, box_h = bbox
 
-    # Zoom-out
     if random.random() > 0.5:
-        scale = random.uniform(0.6, 0.9)
+        scale = random.uniform(0.8, 0.95)
         new_w, new_h = int(w * scale), int(h * scale)
         small = cv2.resize(img, (new_w, new_h))
         canvas = np.zeros_like(img)
@@ -69,36 +92,33 @@ def augment_image(img, bbox):
         box_w = new_w / w
         box_h = new_h / h
 
-    # Rotation
     angle = random.uniform(-30, 30)
     M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
     img = cv2.warpAffine(img, M, (w, h))
 
-    # Flip
     if random.random() > 0.5:
         img = cv2.flip(img, 1)
         x_center = 1 - x_center
 
-    # Brightness/contrast
     alpha = random.uniform(0.8, 1.2)
     beta = random.randint(-20, 20)
     img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
 
-    # Blur
     if random.random() > 0.7:
         img = cv2.GaussianBlur(img, (5, 5), 0)
 
-    # Noise
     if random.random() > 0.7:
         noise = np.random.randint(0, 20, img.shape, dtype='uint8')
         img = cv2.add(img, noise)
 
-    # Color tint
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[..., 0] += random.uniform(-10, 10)
     hsv[..., 1] *= random.uniform(0.9, 1.1)
     hsv = np.clip(hsv, 0, 255).astype(np.uint8)
     img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    if box_w > max_box_ratio or box_h > max_box_ratio:
+        return None, None
 
     return img, (x_center, y_center, box_w, box_h)
 
@@ -111,13 +131,11 @@ def generate_composite(i, img_paths, class_indices, out_img_dir, out_lbl_dir, ar
 
     if arena_path and Path(arena_path).exists():
         arena = cv2.imread(str(arena_path))
-        if arena is not None:
-            arena = cv2.resize(arena, canvas_size)
-            canvas = arena.copy()
-        else:
-            canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
+        arena = cv2.resize(arena, canvas_size) if arena is not None else None
     else:
-        canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
+        arena = None
+
+    canvas = arena.copy() if arena is not None else np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
 
     annotations = []
     used_regions = []
@@ -129,8 +147,15 @@ def generate_composite(i, img_paths, class_indices, out_img_dir, out_lbl_dir, ar
         if img is None:
             continue
 
-        bbox = detect_bounding_box(img)
+        bbox, method = detect_bounding_box(img)
+        if bbox is None or method not in ('circle', 'ellipse'):
+            continue
+        if is_bbox_too_large(*bbox):
+            continue
+
         aug_img, aug_bbox = augment_image(img, bbox)
+        if aug_img is None:
+            continue
 
         h, w = aug_img.shape[:2]
         scale = random.uniform(0.3, 0.6)
@@ -166,14 +191,7 @@ def generate_composite(i, img_paths, class_indices, out_img_dir, out_lbl_dir, ar
         width = bw * new_w / canvas_size[0]
         height = bh * new_h / canvas_size[1]
 
-        annotation = (
-            class_idx,
-            float(np.clip(x_center, 0, 1)),
-            float(np.clip(y_center, 0, 1)),
-            float(np.clip(width, 0, 1)),
-            float(np.clip(height, 0, 1)),
-        )
-        annotations.append(annotation)
+        annotations.append((class_idx, x_center, y_center, width, height))
 
     if annotations:
         out_img = out_img_dir / f"multi_{i}.jpg"
@@ -207,7 +225,12 @@ for file in tqdm(image_files, desc="🔍 Generating single-object images"):
     img = cv2.imread(str(img_path))
     if img is None or img.shape[2] != 3:
         continue
-    bbox = detect_bounding_box(img)
+
+    bbox, method = detect_bounding_box(img)
+    if bbox is None or method not in ('circle', 'ellipse'):
+        continue
+    if is_bbox_too_large(*bbox):
+        continue
     bbox = tuple(np.clip(bbox, 0, 1))
 
     out_img_path = images_dir / f"{class_name}_{img_id}.jpg"
@@ -218,6 +241,8 @@ for file in tqdm(image_files, desc="🔍 Generating single-object images"):
 
     for _ in range(AUG_PER_IMAGE):
         aug, aug_bbox = augment_image(img, bbox)
+        if aug is None:
+            continue
         out_img_path = images_dir / f"{class_name}_{img_id}.jpg"
         label_path = labels_dir / f"{class_name}_{img_id}.txt"
         cv2.imwrite(str(out_img_path), aug)
@@ -257,4 +282,4 @@ def run_command(command):
         print(line, end='')
 
 print("\n🚀 Starting YOLOv5 training...\n")
-run_command(f"python yolov5/train.py --img 640 --batch 16 --epochs 100 --data {yaml_path} --weights yolov5s.pt --name spinchain-yolo")
+run_command(f"python yolov5/train.py --img 640 --batch 64 --epochs 100 --data {yaml_path} --weights yolov5s.pt --name spinchain-yolo")
