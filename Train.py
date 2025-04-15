@@ -79,7 +79,7 @@ def augment_image(img, bbox, max_box_ratio=0.8):
     x_center, y_center, box_w, box_h = bbox
 
     if random.random() > 0.5:
-        scale = random.uniform(0.96, 1.02)
+        scale = random.uniform(0.98, 1.00)
         new_w, new_h = int(w * scale), int(h * scale)
         small = cv2.resize(img, (new_w, new_h))
         canvas = np.zeros_like(img)
