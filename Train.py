@@ -15,8 +15,8 @@ source_dir = Path('.')
 dataset_dir = Path('./beyblade_dataset')
 images_dir = dataset_dir / 'images' / 'train'
 labels_dir = dataset_dir / 'labels' / 'train'
-AUG_PER_IMAGE = 8
-MULTI_IMG_COUNT = 25000
+AUG_PER_IMAGE = 5
+MULTI_IMG_COUNT = 50000
 ARENA_PATH = "arena_bg.jpg"
 
 # --------------------------
@@ -79,7 +79,7 @@ def augment_image(img, bbox, max_box_ratio=0.8):
     x_center, y_center, box_w, box_h = bbox
 
     if random.random() > 0.5:
-        scale = random.uniform(0.8, 0.95)
+        scale = random.uniform(0.96, 1.02)
         new_w, new_h = int(w * scale), int(h * scale)
         small = cv2.resize(img, (new_w, new_h))
         canvas = np.zeros_like(img)
