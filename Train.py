@@ -16,8 +16,11 @@ dataset_dir = Path('./beyblade_dataset')
 images_dir = dataset_dir / 'images' / 'train'
 labels_dir = dataset_dir / 'labels' / 'train'
 AUG_PER_IMAGE = 5
-MULTI_IMG_COUNT = 50000
+MULTI_IMG_COUNT = 15000
 ARENA_PATH = "arena_bg.jpg"
+# bounding box of the dead zone
+DEAD_ZONE_NORM = (0.43, 0.83, 0.14, 0.08)  # (x_center, y_center, width, height)
+
 
 # --------------------------
 # DETECTION FUNCTIONS
@@ -71,8 +74,20 @@ def is_bbox_meaningful(img, bbox):
         return False
     return not is_low_contrast_crop(crop) and has_enough_edges(crop)
 
+def bbox_intersects_dead_zone(x, y, w, h, dz=DEAD_ZONE_NORM):
+    # Convert to corner format
+    x1, y1 = x - w / 2, y - h / 2
+    x2, y2 = x + w / 2, y + h / 2
+
+    dz_x, dz_y, dz_w, dz_h = dz
+    dz_x1, dz_y1 = dz_x - dz_w / 2, dz_y - dz_h / 2
+    dz_x2, dz_y2 = dz_x + dz_w / 2, dz_y + dz_h / 2
+
+    # Check for overlap
+    return not (x2 < dz_x1 or x1 > dz_x2 or y2 < dz_y1 or y1 > dz_y2)
+
 # --------------------------
-# AUGMENTATION FUNCTION (with bbox size check)
+# AUGMENTATION FUNCTION
 # --------------------------
 def augment_image(img, bbox, max_box_ratio=0.8):
     h, w = img.shape[:2]
@@ -92,20 +107,9 @@ def augment_image(img, bbox, max_box_ratio=0.8):
         box_w = new_w / w
         box_h = new_h / h
 
-    angle = random.uniform(-30, 30)
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    img = cv2.warpAffine(img, M, (w, h))
-
-    if random.random() > 0.5:
-        img = cv2.flip(img, 1)
-        x_center = 1 - x_center
-
     alpha = random.uniform(0.8, 1.2)
     beta = random.randint(-20, 20)
     img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
-
-    if random.random() > 0.7:
-        img = cv2.GaussianBlur(img, (5, 5), 0)
 
     if random.random() > 0.7:
         noise = np.random.randint(0, 20, img.shape, dtype='uint8')
@@ -191,6 +195,9 @@ def generate_composite(i, img_paths, class_indices, out_img_dir, out_lbl_dir, ar
         width = bw * new_w / canvas_size[0]
         height = bh * new_h / canvas_size[1]
 
+        if bbox_intersects_dead_zone(x_center, y_center, width, height):
+            continue
+    
         annotations.append((class_idx, x_center, y_center, width, height))
 
     if annotations:
@@ -200,6 +207,8 @@ def generate_composite(i, img_paths, class_indices, out_img_dir, out_lbl_dir, ar
         with open(out_lbl, 'w') as f:
             for class_idx, x, y, w, h in annotations:
                 f.write(f"{class_idx} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n")
+        return True
+    return False
 
 # --------------------------
 # DATASET GENERATION
@@ -214,6 +223,8 @@ class_to_index = {name: i for i, name in enumerate(class_names)}
 print("🧠 Found classes:", class_to_index)
 
 img_id = 0
+augmented_count = 0
+multi_composite_count = 0
 valid_images = []
 valid_classes = []
 
@@ -232,6 +243,8 @@ for file in tqdm(image_files, desc="🔍 Generating single-object images"):
     if is_bbox_too_large(*bbox):
         continue
     bbox = tuple(np.clip(bbox, 0, 1))
+    if bbox_intersects_dead_zone(*bbox):
+        continue
 
     out_img_path = images_dir / f"{class_name}_{img_id}.jpg"
     label_path = labels_dir / f"{class_name}_{img_id}.txt"
@@ -248,16 +261,20 @@ for file in tqdm(image_files, desc="🔍 Generating single-object images"):
         cv2.imwrite(str(out_img_path), aug)
         label_path.write_text(f"{class_index} {aug_bbox[0]:.6f} {aug_bbox[1]:.6f} {aug_bbox[2]:.6f} {aug_bbox[3]:.6f}\n")
         img_id += 1
+        augmented_count += 1
 
     valid_images.append(img_path)
     valid_classes.append(class_index)
 
 print("🧩 Generating multi-object composite images...")
 for i in tqdm(range(img_id, img_id + MULTI_IMG_COUNT), desc="🧩 Composite"):
-    generate_composite(i, valid_images, valid_classes, images_dir, labels_dir, arena_path=ARENA_PATH)
+    if generate_composite(i, valid_images, valid_classes, images_dir, labels_dir, arena_path=ARENA_PATH):
+        multi_composite_count += 1
 img_id += MULTI_IMG_COUNT
 
-print(f"\n✅ Dataset created: {img_id} images")
+print(f"\n✅ Dataset created: {img_id} total images")
+print(f"📈 Augmented images created: {augmented_count}")
+print(f"🎨 Multi-object composite images created: {multi_composite_count}")
 
 # --------------------------
 # CREATE data.yaml
@@ -282,4 +299,7 @@ def run_command(command):
         print(line, end='')
 
 print("\n🚀 Starting YOLOv5 training...\n")
-run_command(f"python yolov5/train.py --img 640 --batch 64 --epochs 100 --data {yaml_path} --weights yolov5s.pt --name spinchain-yolo")
+run_command(f"python yolov5/train.py --img 640 --batch 64 --epochs 120 --data {yaml_path} --weights yolov5s.pt --name spinchain-yolo")
+print(f"\n✅ Dataset created: {img_id} total images")
+print(f"📈 Augmented images created: {augmented_count}")
+print(f"🎨 Multi-object composite images created: {multi_composite_count}")
