@@ -16,10 +16,11 @@ dataset_dir = Path('./beyblade_dataset')
 images_dir = dataset_dir / 'images' / 'train'
 labels_dir = dataset_dir / 'labels' / 'train'
 AUG_PER_IMAGE = 5
-MULTI_IMG_COUNT = 15000
+MULTI_IMG_COUNT = 20000
 ARENA_PATH = "arena_bg.jpg"
 # bounding box of the dead zone
-DEAD_ZONE_NORM = (0.43, 0.83, 0.14, 0.08)  # (x_center, y_center, width, height)
+DEAD_ZONE_NORM = (0.53, 0.95, 0.045, 0.11)
+SHRINK_BBOX = 0.80
 
 
 # --------------------------
@@ -34,7 +35,7 @@ def detect_bounding_box(img):
                                param1=50, param2=20, minRadius=15, maxRadius=60)
     if circles is not None:
         x, y, r = np.round(circles[0, 0]).astype("int")
-        return (x / w, y / h, 2 * r / w, 2 * r / h), 'circle'
+        return (x / w, y / h, (2 * r / w) * SHRINK_BBOX, (2 * r / h) * SHRINK_BBOX), 'circle'
 
     _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -44,7 +45,7 @@ def detect_bounding_box(img):
         cnt = max(contours, key=cv2.contourArea)
         if len(cnt) >= 5:
             (x, y), (MA, ma), _ = cv2.fitEllipse(cnt)
-            return (x / w, y / h, MA / w, ma / h), 'ellipse'
+            return (x / w, y / h, (MA / w) * SHRINK_BBOX, (ma / h) * SHRINK_BBOX), 'ellipse'
 
     return None, 'none'
 
