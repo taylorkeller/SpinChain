@@ -4,7 +4,12 @@ import torch
 import time
 from collections import deque
 import os
-import blockchain_logger  # must define record_match(...)
+import blockchain_logger  # contains record_match_with_signature_and_merkle
+
+# Settings
+MIN_SEEN_FRAMES = 10
+AUTO_SHUTDOWN_FRAMES = 180
+MAX_MISSING_FRAMES = 180
 
 # Load YOLOv5 model
 model = torch.hub.load('ultralytics/yolov5', 'custom', path='yolov5/runs/train/spinchain-yolo/weights/best.pt')
@@ -12,15 +17,15 @@ model.conf = 0.1
 model.iou = 0.05
 model.to('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Webcam
+# Webcam config
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.9)
 cap.set(39, 0)   # Disable autofocus
 cap.set(28, 30)  # Manual focus
 
+# ROI Stability Tracker
 class ROIStabilityTracker:
     def __init__(self, class_id):
         self.class_id = class_id
@@ -64,7 +69,7 @@ class ROIStabilityTracker:
             else:
                 self.last_status = "Moving"
 
-        if self.stability_score < 0.30:
+        if self.stability_score < 0.150:
             self.stable_count += 1
             if self.stable_count >= 15:
                 if self.last_status != "Stopped":
@@ -76,27 +81,26 @@ class ROIStabilityTracker:
 
         return self.last_status
 
+# State
 trackers = {}
 stop_by_class = {}
 last_seen_frame = {}
+seen_frames_by_class = {}
 next_id = 0
 frame_index = 0
-AUTO_SHUTDOWN_FRAMES = 180
-MAX_MISSING_FRAMES = 180
 shutdown_triggered = False
 shutdown_start_frame = None
+telemetry_events = []
+final_stopped_names = []
 
-def match_tracker(center, cls, threshold=80):
+def match_tracker(center, name, threshold=80):
     best, dist = None, float('inf')
     for tid, t in trackers.items():
-        if t.class_id == cls and t.last_pos is not None:
+        if t.class_id == name and t.last_pos is not None:
             d = np.linalg.norm(np.array(t.last_pos) - np.array(center))
             if d < threshold and d < dist:
                 best, dist = tid, d
     return best
-
-# 🛠 Store actual stopped class IDs in order
-final_stopped_ids = []
 
 while True:
     ret, frame = cap.read()
@@ -109,14 +113,14 @@ while True:
     for *xyxy, conf, cls in results.xyxy[0]:
         x1, y1, x2, y2 = map(int, xyxy)
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        cls_id = int(cls)
+        name = model.names[int(cls)]
         center = (cx, cy)
 
-        matched = match_tracker(center, cls_id)
+        matched = match_tracker(center, name)
         if matched is not None:
             tracker = trackers[matched]
         else:
-            tracker = ROIStabilityTracker(cls_id)
+            tracker = ROIStabilityTracker(name)
             trackers[next_id] = tracker
             matched = next_id
             next_id += 1
@@ -124,19 +128,27 @@ while True:
         tracker.last_pos = center
         status = tracker.update(frame, center, frame_index)
         current_ids.add(matched)
-        last_seen_frame[cls_id] = frame_index
+        last_seen_frame[name] = frame_index
+        seen_frames_by_class[name] = seen_frames_by_class.get(name, 0) + 1
 
-        if status == "Stopped" and cls_id not in stop_by_class:
-            stop_by_class[cls_id] = frame_index
-            final_stopped_ids.append(cls_id)
-            print(f"[Frame {frame_index}] ❌ {model.names[cls_id]} has stopped.")
+        if seen_frames_by_class[name] < MIN_SEEN_FRAMES:
+            continue
 
-    # Check for lost Beyblades
-    for cid, last_seen in last_seen_frame.items():
-        if cid not in stop_by_class and frame_index - last_seen > MAX_MISSING_FRAMES:
-            stop_by_class[cid] = frame_index
-            final_stopped_ids.append(cid)
-            print(f"[Frame {frame_index}] ❌ {model.names[cid]} lost for 3s — declared stopped.")
+        if status == "Stopped" and name not in stop_by_class:
+            stop_by_class[name] = frame_index
+            final_stopped_names.append(name)
+            log = f"{name} stopped at frame {frame_index}"
+            telemetry_events.append(log)
+            print(f"[Frame {frame_index}] ❌ {log}")
+
+    for cname, last_seen in last_seen_frame.items():
+        if cname not in stop_by_class and frame_index - last_seen > MAX_MISSING_FRAMES:
+            if seen_frames_by_class.get(cname, 0) >= MIN_SEEN_FRAMES:
+                stop_by_class[cname] = frame_index
+                final_stopped_names.append(cname)
+                log = f"{cname} lost at frame {frame_index}"
+                telemetry_events.append(log)
+                print(f"[Frame {frame_index}] ❌ {log}")
 
     if not shutdown_triggered and len(stop_by_class) > 0:
         shutdown_triggered = True
@@ -148,12 +160,15 @@ while True:
 
     for tid in current_ids:
         t = trackers[tid]
-        label = f"{model.names[t.class_id]}: {t.last_status} (Δ={t.stability_score:.2f})"
+        label = f"{t.class_id}: {t.last_status} (Δ={t.stability_score:.2f})"
         color = (0, 255, 0) if t.last_status == "Moving" else (0, 0, 255)
         if t.last_pos:
             cv2.circle(frame, t.last_pos, 20, color, 2)
             cv2.putText(frame, label, (t.last_pos[0] - 70, t.last_pos[1] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # 🔎 Diagnostic: Show how long each class has been tracked
+    for name in seen_frames_by_class:
+        print(f"[{frame_index}] 👁️ {name} seen {seen_frames_by_class[name]} frames")
 
     cv2.imshow("ROI Stability Beyblade Tracker", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -162,29 +177,45 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 
-# 📋 Print final stop order
+
+# 📋 Final stop order
 print("\n📋 Stop Order:")
-for i, (cls_id, frame_idx) in enumerate(stop_by_class.items()):
-    print(f"{i+1}. {model.names[cls_id]} stopped at frame {frame_idx}")
+for i, (name, frame_idx) in enumerate(stop_by_class.items()):
+    print(f"{i+1}. {name} stopped at frame {frame_idx}")
 
-# 🧠 Determine match result
-if len(final_stopped_ids) >= 2:
-    id1, id2 = final_stopped_ids[:2]
-    name1 = model.names[id1]
-    name2 = model.names[id2]
+# 🧠 Decide winner and loser from stopped vs seen
+if len(stop_by_class) == 1 and len(seen_frames_by_class) >= 2:
+    stopped = next(iter(stop_by_class))
+    possible_opponents = [name for name in seen_frames_by_class if name != stopped and seen_frames_by_class[name] >= MIN_SEEN_FRAMES]
 
-    if id1 in stop_by_class and id2 in stop_by_class:
-        winner = name2 if stop_by_class[id1] < stop_by_class[id2] else name1
-        loser = name1 if winner == name2 else name2
+    if possible_opponents:
+        moving = possible_opponents[0]
+        winner = moving
+        loser = stopped
         tie = "No"
-    elif id1 in stop_by_class:
-        winner, loser, tie = name2, name1, "No"
-    elif id2 in stop_by_class:
-        winner, loser, tie = name1, name2, "No"
+
+        print(f"\n🏁 Submitting result: {winner} vs {loser} | Winner: {winner} | Loser: {loser} | Tie: {tie}")
+        tx_hash = blockchain_logger.record_match_with_signature_and_merkle(
+            winner, loser, winner, loser, tie, telemetry_events
+        )
+        print(f"✅ Submitted match to blockchain: {tx_hash}")
     else:
-        winner = loser = "None"
-        tie = "Yes"
+        print("⚠️ No valid opponent found for stopped Beyblade.")
+
+elif len(stop_by_class) >= 2:
+    # fallback to traditional 2-blade stop logic
+    name1, name2 = list(stop_by_class.keys())[:2]
+
+    if stop_by_class[name1] < stop_by_class[name2]:
+        winner, loser = name2, name1
+    else:
+        winner, loser = name1, name2
+    tie = "No"
 
     print(f"\n🏁 Submitting result: {name1} vs {name2} | Winner: {winner} | Loser: {loser} | Tie: {tie}")
-    tx_hash = blockchain_logger.record_match(name1, name2, winner, loser, tie)
+    tx_hash = blockchain_logger.record_match_with_signature_and_merkle(
+        name1, name2, winner, loser, tie, telemetry_events
+    )
     print(f"✅ Submitted match to blockchain: {tx_hash}")
+else:
+    print("⚠️ Not enough Beyblades tracked to determine a valid match.")
