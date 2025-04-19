@@ -5,9 +5,10 @@ import time
 from collections import deque
 import os
 import blockchain_logger  # contains record_match_with_signature_and_merkle
+from blockchain_logger import request_challenge, record_match_with_signature_and_merkle
 
 # Settings
-MIN_SEEN_FRAMES = 10
+MIN_SEEN_FRAMES = 100
 AUTO_SHUTDOWN_FRAMES = 180
 MAX_MISSING_FRAMES = 180
 
@@ -22,6 +23,7 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_FPS, 60)
+cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.9)
 cap.set(39, 0)   # Disable autofocus
 cap.set(28, 30)  # Manual focus
 
@@ -69,7 +71,7 @@ class ROIStabilityTracker:
             else:
                 self.last_status = "Moving"
 
-        if self.stability_score < 0.150:
+        if self.stability_score < 0.20:
             self.stable_count += 1
             if self.stable_count >= 15:
                 if self.last_status != "Stopped":
@@ -203,19 +205,25 @@ if len(stop_by_class) == 1 and len(seen_frames_by_class) >= 2:
         print("⚠️ No valid opponent found for stopped Beyblade.")
 
 elif len(stop_by_class) >= 2:
-    # fallback to traditional 2-blade stop logic
+    
     name1, name2 = list(stop_by_class.keys())[:2]
+    frame1 = stop_by_class[name1]
+    frame2 = stop_by_class[name2]
 
-    if stop_by_class[name1] < stop_by_class[name2]:
+    if frame1 == frame2:
+        winner = loser = "None"
+        tie = "Yes"
+    elif frame1 < frame2:
         winner, loser = name2, name1
+        tie = "No"
     else:
         winner, loser = name1, name2
-    tie = "No"
+        tie = "No"
 
+    request_challenge()
+    time.sleep(3)
     print(f"\n🏁 Submitting result: {name1} vs {name2} | Winner: {winner} | Loser: {loser} | Tie: {tie}")
     tx_hash = blockchain_logger.record_match_with_signature_and_merkle(
         name1, name2, winner, loser, tie, telemetry_events
     )
     print(f"✅ Submitted match to blockchain: {tx_hash}")
-else:
-    print("⚠️ Not enough Beyblades tracked to determine a valid match.")
