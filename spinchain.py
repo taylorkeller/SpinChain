@@ -2,32 +2,46 @@ import cv2
 import numpy as np
 import torch
 import time
-from collections import deque
 import os
-import blockchain_logger  # contains record_match_with_signature_and_merkle
-from blockchain_logger import request_challenge, record_match_with_signature_and_merkle
+import hashlib
+import secrets
+from collections import deque
+from dotenv import load_dotenv
+from eth_utils import keccak
+from eth_abi import encode
+from eth_abi.packed import encode_packed
+from blockchain_logger import verify_shared_secret_hash
+from blockchain_logger import contract
+from blockchain_logger import request_challenge, record_match_with_hmac
 
-# Settings
+# === Load .env ===
+load_dotenv()
+
+# === Settings ===
 MIN_SEEN_FRAMES = 100
 AUTO_SHUTDOWN_FRAMES = 180
 MAX_MISSING_FRAMES = 180
+MODEL_VERSION = "v1.0"
+MODEL_PATH = "yolov5/runs/train/spinchain-yolo/weights/best.pt"
 
-# Load YOLOv5 model
-model = torch.hub.load('ultralytics/yolov5', 'custom', path='yolov5/runs/train/spinchain-yolo/weights/best.pt')
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+
+# === Load YOLOv5 model ===
+model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH)
 model.conf = 0.1
 model.iou = 0.05
 model.to('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Webcam config
+# === Webcam ===
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.9)
 cap.set(39, 0)   # Disable autofocus
 cap.set(28, 30)  # Manual focus
 
-# ROI Stability Tracker
+# === ROI Tracker ===
 class ROIStabilityTracker:
     def __init__(self, class_id):
         self.class_id = class_id
@@ -83,7 +97,7 @@ class ROIStabilityTracker:
 
         return self.last_status
 
-# State
+# === Start State ===
 trackers = {}
 stop_by_class = {}
 last_seen_frame = {}
@@ -168,7 +182,7 @@ while True:
             cv2.circle(frame, t.last_pos, 20, color, 2)
             cv2.putText(frame, label, (t.last_pos[0] - 70, t.last_pos[1] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        # 🔎 Diagnostic: Show how long each class has been tracked
+
     for name in seen_frames_by_class:
         print(f"[{frame_index}] 👁️ {name} seen {seen_frames_by_class[name]} frames")
 
@@ -179,13 +193,12 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 
-
-# 📋 Final stop order
+# === Final stop order ===
 print("\n📋 Stop Order:")
 for i, (name, frame_idx) in enumerate(stop_by_class.items()):
     print(f"{i+1}. {name} stopped at frame {frame_idx}")
 
-# 🧠 Decide winner and loser from stopped vs seen
+# === Win/Lose Conditions ===
 if len(stop_by_class) == 1 and len(seen_frames_by_class) >= 2:
     stopped = next(iter(stop_by_class))
     possible_opponents = [name for name in seen_frames_by_class if name != stopped and seen_frames_by_class[name] >= MIN_SEEN_FRAMES]
@@ -194,36 +207,78 @@ if len(stop_by_class) == 1 and len(seen_frames_by_class) >= 2:
         moving = possible_opponents[0]
         winner = moving
         loser = stopped
-        tie = "No"
-
-        print(f"\n🏁 Submitting result: {winner} vs {loser} | Winner: {winner} | Loser: {loser} | Tie: {tie}")
-        tx_hash = blockchain_logger.record_match_with_signature_and_merkle(
-            winner, loser, winner, loser, tie, telemetry_events
-        )
-        print(f"✅ Submitted match to blockchain: {tx_hash}")
+        tie = False
+        name1, name2 = winner, loser
     else:
-        print("⚠️ No valid opponent found for stopped Beyblade.")
+        print("⚠️ No valid opponent found.")
+        exit()
 
 elif len(stop_by_class) >= 2:
-    
     name1, name2 = list(stop_by_class.keys())[:2]
     frame1 = stop_by_class[name1]
     frame2 = stop_by_class[name2]
 
     if frame1 == frame2:
         winner = loser = "None"
-        tie = "Yes"
+        tie = True
     elif frame1 < frame2:
         winner, loser = name2, name1
-        tie = "No"
+        tie = False
     else:
         winner, loser = name1, name2
-        tie = "No"
+        tie = False
+else:
+    print("⚠️ Not enough Beyblades tracked to determine a valid match.")
+    exit()
 
-    request_challenge()
-    time.sleep(3)
-    print(f"\n🏁 Submitting result: {name1} vs {name2} | Winner: {winner} | Loser: {loser} | Tie: {tie}")
-    tx_hash = blockchain_logger.record_match_with_signature_and_merkle(
-        name1, name2, winner, loser, tie, telemetry_events
-    )
-    print(f"✅ Submitted match to blockchain: {tx_hash}")
+
+# === Generate random secret and hash it
+ephemeral_secret = secrets.token_bytes(32)
+secret_hash = keccak(ephemeral_secret)
+
+# === Request challenge from blockchain using the secret hash
+challenge = request_challenge(secret_hash)
+onchain_hash = contract.functions.getSharedSecretHash(WALLET_ADDRESS).call()
+
+# === Required for challenge to be requested and verified
+time.sleep(3)
+verify_shared_secret_hash(secret_hash)
+with open(MODEL_PATH, "rb") as f:
+    model_hash = hashlib.sha256(f.read()).digest()
+
+def to_hex_string32(b):
+    return ''.join(f'{x:02x}' for x in b)
+
+
+
+# === Structured typed match hash
+typed_data = encode(
+    ["string", "bytes32", "string", "string", "bool"],
+    [MODEL_VERSION, model_hash, winner, loser, tie]
+)
+
+match_hash = keccak(typed_data)
+message = match_hash + challenge
+packed = encode_packed(['bytes32', 'bytes32', 'bytes32'], [secret_hash,  match_hash, challenge])
+leaves = telemetry_events  # use raw event strings
+
+# === Submit match to blockchain 
+print("📤 Telemetry being submitted:")
+for i, leaf in enumerate(telemetry_events):
+    print(f"  [{i}] {repr(leaf)}")
+
+
+
+print(f"\n🏁 Submitting result: {name1} vs {name2} | Winner: {winner} | Loser: {loser} | Tie: {tie}")
+tx_hash = record_match_with_hmac(
+    model_version=MODEL_VERSION,
+    model_hash=model_hash,
+    winner=winner,
+    loser=loser,
+    tie=tie,
+    telemetry_leaves=leaves,
+    challenge=challenge,
+    hmac_signature = encode_packed(['bytes32', 'bytes32', 'bytes32'], [secret_hash,  match_hash, challenge])
+
+)
+print(f"✅ Submitted match to blockchain: {tx_hash}")
