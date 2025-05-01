@@ -13,6 +13,9 @@ from eth_abi.packed import encode_packed
 from blockchain_logger import verify_shared_secret_hash
 from blockchain_logger import contract
 from blockchain_logger import request_challenge, record_match_with_hmac
+import qrcode
+from pyzbar.pyzbar import decode
+import threading
 
 # === Load .env ===
 load_dotenv()
@@ -38,8 +41,39 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(39, 0)   # Disable autofocus
-cap.set(28, 30)  # Manual focus
+cap.set(39, 0)
+cap.set(28, 30)
+
+# === Secret and QR ===
+ephemeral_secret = secrets.token_bytes(32)
+secret_hash = keccak(ephemeral_secret)
+print(f"🪪 Display this in QR form: {secret_hash.hex()}")
+
+def render_challenge_qr(text):
+    qr = qrcode.make(text)
+    return np.array(qr.convert('RGB'))
+
+qr_img = render_challenge_qr(secret_hash.hex())
+qr_img = cv2.resize(qr_img, (100, 100))
+
+def decode_embedded_qr(qr_img):
+    decoded = decode(qr_img)
+    if decoded:
+        return decoded[0].data.decode().strip()
+    return ""
+
+# === QR State ===
+qr_confirm_count = 0
+challenge_verified = False
+CHALLENGE_FRAMES_REQUIRED = 10
+challenge = None
+
+def submit_challenge_tx():
+    global challenge
+    print("🛰 Sending challenge to blockchain...")
+    challenge = request_challenge(secret_hash)
+    verify_shared_secret_hash(secret_hash)
+    print("✅ Blockchain challenge complete.")
 
 # === ROI Tracker ===
 class ROIStabilityTracker:
@@ -97,7 +131,16 @@ class ROIStabilityTracker:
 
         return self.last_status
 
-# === Start State ===
+def match_tracker(center, name, threshold=80):
+    best, dist = None, float('inf')
+    for tid, t in trackers.items():
+        if t.class_id == name and t.last_pos is not None:
+            d = np.linalg.norm(np.array(t.last_pos) - np.array(center))
+            if d < threshold and d < dist:
+                best, dist = tid, d
+    return best
+
+# === State Variables ===
 trackers = {}
 stop_by_class = {}
 last_seen_frame = {}
@@ -109,20 +152,42 @@ shutdown_start_frame = None
 telemetry_events = []
 final_stopped_names = []
 
-def match_tracker(center, name, threshold=80):
-    best, dist = None, float('inf')
-    for tid, t in trackers.items():
-        if t.class_id == name and t.last_pos is not None:
-            d = np.linalg.norm(np.array(t.last_pos) - np.array(center))
-            if d < threshold and d < dist:
-                best, dist = tid, d
-    return best
-
+# === Main Loop ===
 while True:
     ret, frame = cap.read()
     if not ret:
-        break
+        print("❌ Frame read failed.")
+        time.sleep(0.5)
+        continue
+
     frame_index += 1
+
+    if not challenge_verified:
+        decoded = decode_embedded_qr(qr_img)
+        print(f"[QR Decode] Got: {decoded[:12]}... Expected: {secret_hash.hex()[:12]}...")
+
+        if decoded == secret_hash.hex():
+            qr_confirm_count += 1
+            print(f"[QR] Confirm {qr_confirm_count}/{CHALLENGE_FRAMES_REQUIRED}")
+        else:
+            qr_confirm_count = 0
+
+        if qr_confirm_count >= CHALLENGE_FRAMES_REQUIRED:
+            print("✅ QR threshold met. Starting match tracking and blockchain thread...")
+            threading.Thread(target=submit_challenge_tx, daemon=True).start()
+            challenge_verified = True
+            qr_confirm_count = 0
+            continue
+
+        frame[10:110, frame.shape[1] - 110:frame.shape[1] - 10] = qr_img
+        overlay_text = f"CHALLENGE: {secret_hash.hex()[:12]}..."
+        cv2.putText(frame, overlay_text, (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imshow("ROI Stability Beyblade Tracker", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
+
+    # === Match tracking logic ===
     current_ids = set()
     results = model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
@@ -186,12 +251,25 @@ while True:
     for name in seen_frames_by_class:
         print(f"[{frame_index}] 👁️ {name} seen {seen_frames_by_class[name]} frames")
 
+    frame[10:110, frame.shape[1] - 110:frame.shape[1] - 10] = qr_img
+    overlay_text = f"CHALLENGE: {secret_hash.hex()[:12]}..."
+    cv2.putText(frame, overlay_text, (10, frame.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     cv2.imshow("ROI Stability Beyblade Tracker", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
+
+# Wait for blockchain challenge to complete if necessary
+while challenge is None:
+    print("⏳ Waiting for blockchain challenge to complete...")
+    time.sleep(0.5)
+
+
+
+
 
 # === Final stop order ===
 print("\n📋 Stop Order:")
@@ -232,9 +310,7 @@ else:
     exit()
 
 
-# === Generate random secret and hash it
-ephemeral_secret = secrets.token_bytes(32)
-secret_hash = keccak(ephemeral_secret)
+
 
 # === Request challenge from blockchain using the secret hash
 challenge = request_challenge(secret_hash)
@@ -266,6 +342,7 @@ leaves = telemetry_events  # use raw event strings
 print("📤 Telemetry being submitted:")
 for i, leaf in enumerate(telemetry_events):
     print(f"  [{i}] {repr(leaf)}")
+
 
 
 
