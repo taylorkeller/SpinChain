@@ -381,9 +381,6 @@ typed_data = encode(
 # Compute final match hash using Keccak256 on encoded data 
 match_hash = keccak(typed_data)
 
-# Compose message with challenge (used for HMAC signature in contract) 
-message = match_hash + challenge
-
 # Packed format used as HMAC payload in the final on-chain record
 packed = encode_packed(['bytes32', 'bytes32', 'bytes32'], [secret_hash,  match_hash, challenge])
 
